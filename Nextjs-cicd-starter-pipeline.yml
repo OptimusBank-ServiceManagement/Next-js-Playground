@@ -1,17 +1,707 @@
 trigger:
-  branches:
-    include:
-      - main
+- app-dev
 
+# Disable PR triggers - we only want this to run when merges are completed
 pr: none
 
-resources:
-  repositories:
-    - repository: templates
-      type: github
-      name: OptimusBank-ServiceManagementOrg/Azure-Nextjs-CICD
-      ref: main
-      endpoint: optimus-github-service-connection
+pool:
+  name: Default  # Self-hosted agent pool
 
-jobs:
-  - template: nextjs-cicd-scripts/Nextjs-cicd-staging.yml@templates
+variables:
+  # SMTP variables defined in variable group
+  - group: smtp-variables
+  # Static variables
+  - name: repoName
+    value: $[replace(variables['Build.Repository.Name'], '.*/','')]
+  - name: buildConfiguration
+    value: 'production'
+  - name: nodeVersion
+    value: '18.x'
+  - name: siteName
+    value: '$(repoName)'
+  - name: physicalPath
+    value: 'C:\inetpub\wwwroot\$(repoName)'
+  - name: appPoolName
+    value: '$(repoName)-pool'
+  - name: parentSiteName
+    value: 'Optimus Apps'
+
+stages:
+- stage: Validate
+  displayName: 'Validate Project'
+  jobs:
+  - job: CheckProject
+    displayName: 'Check for Next.js Project'
+    steps:
+    - checkout: self
+      displayName: 'Checkout Source Code'
+      
+    - task: PowerShell@2
+      displayName: 'Validate Next.js Project'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "===== VALIDATING NEXT.JS PROJECT ====="
+          
+          $packageJsonPath = "$(Build.SourcesDirectory)\package.json"
+          $hasProject = $false
+          
+          if (Test-Path $packageJsonPath) {
+              Write-Host "Found package.json at: $packageJsonPath"
+              
+              try {
+                  $packageContent = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+                  $hasNextJs = $packageContent.dependencies.next -or $packageContent.devDependencies.next
+                  
+                  if ($hasNextJs) {
+                      Write-Host "✓ Next.js dependency found"
+                      $hasProject = $true
+                  } else {
+                      Write-Host "✗ No Next.js dependency found"
+                  }
+              } catch {
+                  Write-Host "✗ Error parsing package.json: $_"
+              }
+          } else {
+              Write-Host "✗ No package.json found in root directory"
+          }
+          
+          # Set output variable for subsequent stages
+          Write-Host "##vso[task.setvariable variable=hasProject;isOutput=true]$hasProject"
+          
+          if (-not $hasProject) {
+              Write-Host "This appears to be an initial sync - pipeline will skip build and deployment"
+          }
+      name: 'ProjectCheck'
+
+- stage: Build
+  displayName: 'Build Application'
+  dependsOn: Validate
+  condition: eq(dependencies.Validate.outputs['CheckProject.ProjectCheck.hasProject'], 'true')
+  jobs:
+  - job: BuildNextJs
+    displayName: 'Build Next.js Application'
+    steps:
+    - checkout: self
+      displayName: 'Checkout Source Code'
+      
+    - task: NodeTool@0
+      displayName: 'Setup Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    - task: Cache@2
+      displayName: 'Cache node_modules'
+      inputs:
+        key: 'npm | "$(Agent.OS)" | $(Build.SourcesDirectory)/package-lock.json'
+        restoreKeys: |
+          npm | "$(Agent.OS)"
+        path: $(Build.SourcesDirectory)/node_modules
+
+    - task: PowerShell@2
+      displayName: 'Install Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Set-Location "$(Build.SourcesDirectory)"
+          
+          if (Test-Path "package-lock.json") {
+              Write-Host "Using npm ci for reproducible builds"
+              npm ci --prefer-offline
+          } elseif (Test-Path "yarn.lock") {
+              Write-Host "Using yarn with frozen lockfile"
+              yarn install --frozen-lockfile --prefer-offline
+          } else {
+              Write-Host "Using npm install (no lockfile found)"
+              npm install
+          }
+
+    - task: PowerShell@2
+      displayName: 'Run Linting'
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          Set-Location "$(Build.SourcesDirectory)"
+          
+          try {
+              $packageJson = Get-Content "package.json" -Raw | ConvertFrom-Json
+              
+              if ($packageJson.scripts.lint) {
+                  Write-Host "Checking if ESLint is configured..."
+                  
+                  # Check if .eslintrc exists or eslint config in package.json
+                  $hasEslintConfig = (Test-Path ".eslintrc*") -or $packageJson.eslintConfig -or $packageJson.devDependencies.eslint
+                  
+                  if ($hasEslintConfig) {
+                      Write-Host "Running linting..."
+                      # Use --no-fix to prevent interactive prompts and --quiet to reduce output
+                      npm run lint -- --no-fix --quiet
+                  } else {
+                      Write-Host "ESLint not configured, setting up basic Next.js ESLint config..."
+                      # Create basic .eslintrc.json for Next.js
+                      $eslintConfig = @{
+                          extends = @("next/core-web-vitals")
+                      } | ConvertTo-Json -Depth 3
+                      
+                      $eslintConfig | Out-File -FilePath ".eslintrc.json" -Encoding UTF8
+                      
+                      # Install eslint if not present
+                      if (-not $packageJson.devDependencies.eslint) {
+                          Write-Host "Installing ESLint..."
+                          npm install --save-dev eslint eslint-config-next
+                      }
+                      
+                      Write-Host "Running linting with new configuration..."
+                      npm run lint -- --no-fix --quiet
+                  }
+              } else {
+                  Write-Host "No lint script found, skipping linting"
+              }
+          } catch {
+              Write-Host "Linting failed: $($_.Exception.Message)"
+              Write-Host "Continuing with build process..."
+          }
+
+    - task: PowerShell@2
+      displayName: 'Run Tests'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Set-Location "$(Build.SourcesDirectory)"
+          $packageJson = Get-Content "package.json" -Raw | ConvertFrom-Json
+          
+          if ($packageJson.scripts.test) {
+              Write-Host "Running tests..."
+              npm run test -- --watchAll=false --ci=true --coverage --reporters=default --reporters=jest-junit
+          } else {
+              Write-Host "No test script found, skipping tests"
+          }
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        failTaskOnFailedTests: true
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish Code Coverage'
+      condition: succeededOrFailed()
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.SourcesDirectory)/coverage/cobertura-coverage.xml'
+
+    - task: PowerShell@2
+      displayName: 'Build Application'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Set-Location "$(Build.SourcesDirectory)"
+          
+          # Set production environment variables
+          $env:NODE_ENV = "production"
+          $env:NEXT_TELEMETRY_DISABLED = "1"
+          
+          Write-Host "Building Next.js application..."
+          npm run build
+          
+          # Verify build output
+          if (Test-Path ".next") {
+              Write-Host "✓ Build successful - .next directory created"
+              
+              # Check build size
+              $buildSize = (Get-ChildItem ".next" -Recurse | Measure-Object -Property Length -Sum).Sum
+              Write-Host "Build size: $([math]::Round($buildSize/1MB, 2)) MB"
+          } else {
+              Write-Error "✗ Build failed - .next directory not found"
+              exit 1
+          }
+
+    - task: PowerShell@2
+      displayName: 'Handle Static Export'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Set-Location "$(Build.SourcesDirectory)"
+          $packageJson = Get-Content "package.json" -Raw | ConvertFrom-Json
+          
+          if ($packageJson.scripts.export) {
+              Write-Host "Running static export..."
+              npm run export
+              
+              if (Test-Path "out") {
+                  Write-Host "✓ Static export successful"
+                  Write-Host "##vso[task.setvariable variable=useStaticExport;isOutput=true]true"
+              } else {
+                  Write-Host "✗ Export failed - out directory not found"
+                  Write-Host "##vso[task.setvariable variable=useStaticExport;isOutput=true]false"
+              }
+          } else {
+              Write-Host "No export script - deploying as server-side app"
+              Write-Host "##vso[task.setvariable variable=useStaticExport;isOutput=true]false"
+          }
+      name: 'ExportCheck'
+
+    - task: PowerShell@2
+      displayName: 'Prepare Deployment Package'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publishDir = "$(Build.ArtifactStagingDirectory)\publish"
+          $useStaticExport = "$(ExportCheck.useStaticExport)"
+          
+          New-Item -ItemType Directory -Path $publishDir -Force
+          Set-Location "$(Build.SourcesDirectory)"
+          
+          if ($useStaticExport -eq "true" -and (Test-Path "out")) {
+              Write-Host "Packaging static export..."
+              Copy-Item -Path "out\*" -Destination $publishDir -Recurse -Force
+          } else {
+              Write-Host "Packaging server-side application..."
+              
+              # Essential files for Next.js server deployment
+              $filesToCopy = @(
+                  @{ Source = ".next"; Required = $true },
+                  @{ Source = "public"; Required = $false },
+                  @{ Source = "package.json"; Required = $true },
+                  @{ Source = "package-lock.json"; Required = $false },
+                  @{ Source = "yarn.lock"; Required = $false }
+              )
+              
+              foreach ($file in $filesToCopy) {
+                  if (Test-Path $file.Source) {
+                      Write-Host "Copying $($file.Source)..."
+                      Copy-Item -Path $file.Source -Destination $publishDir -Recurse -Force
+                  } elseif ($file.Required) {
+                      Write-Error "Required file $($file.Source) not found!"
+                      exit 1
+                  }
+              }
+              
+              # Copy next.config files with wildcard handling
+              $nextConfigFiles = Get-ChildItem -Path "next.config.*" -ErrorAction SilentlyContinue
+              if ($nextConfigFiles) {
+                  Write-Host "Copying Next.js config files..."
+                  foreach ($configFile in $nextConfigFiles) {
+                      Copy-Item -Path $configFile.FullName -Destination $publishDir -Force
+                  }
+              }
+          }
+          
+          Write-Host "Deployment package prepared in: $publishDir"
+
+    - task: PowerShell@2
+      displayName: 'Create Server Configuration'
+      condition: eq(variables['ExportCheck.useStaticExport'], 'false')
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publishDir = "$(Build.ArtifactStagingDirectory)\publish"
+          
+          # Create server.js for IIS Node.js hosting
+          $serverJs = @'
+          const { createServer } = require('http')
+          const { parse } = require('url')
+          const next = require('next')
+
+          const dev = process.env.NODE_ENV !== 'production'
+          const hostname = process.env.WEBSITE_HOSTNAME || 'localhost'
+          const port = process.env.PORT || 3000
+
+          const app = next({ dev, hostname, port })
+          const handle = app.getRequestHandler()
+
+          app.prepare().then(() => {
+            createServer(async (req, res) => {
+              try {
+                const parsedUrl = parse(req.url, true)
+                await handle(req, res, parsedUrl)
+              } catch (err) {
+                console.error('Error occurred handling', req.url, err)
+                res.statusCode = 500
+                res.end('internal server error')
+              }
+            }).listen(port, (err) => {
+              if (err) throw err
+              console.log(`> Ready on http://${hostname}:${port}`)
+            })
+          })
+          '@
+          
+          $serverJs | Out-File -FilePath "$publishDir\server.js" -Encoding UTF8
+          Write-Host "Server.js created successfully"
+
+    - task: PowerShell@2
+      displayName: 'Create IIS Configuration'
+      condition: eq(variables['ExportCheck.useStaticExport'], 'false')
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publishDir = "$(Build.ArtifactStagingDirectory)\publish"
+          
+          # Create web.config for IIS
+          $webConfig = @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <system.webServer>
+              <handlers>
+                <add name="iisnode" path="server.js" verb="*" modules="iisnode"/>
+              </handlers>
+              <rewrite>
+                <rules>
+                  <rule name="NodeInspector" patternSyntax="ECMAScript" stopProcessing="true">
+                    <match url="^server.js\/debug[\/]?" />
+                  </rule>
+                  <rule name="StaticContent">
+                    <action type="Rewrite" url="public{REQUEST_URI}"/>
+                  </rule>
+                  <rule name="DynamicContent">
+                    <conditions>
+                      <add input="{REQUEST_FILENAME}" matchType="IsFile" negate="True"/>
+                    </conditions>
+                    <action type="Rewrite" url="server.js"/>
+                  </rule>
+                </rules>
+              </rewrite>
+              <security>
+                <requestFiltering>
+                  <hiddenSegments>
+                    <remove segment="bin"/>
+                  </hiddenSegments>
+                </requestFiltering>
+              </security>
+              <httpErrors existingResponse="PassThrough" />
+              <httpCompression>
+                <dynamicTypes>
+                  <add mimeType="application/json" enabled="true"/>
+                  <add mimeType="application/javascript" enabled="true"/>
+                </dynamicTypes>
+              </httpCompression>
+              <iisnode watchedFiles="web.config;*.js" loggingEnabled="true" debuggingEnabled="false"/>
+            </system.webServer>
+          </configuration>
+          '@
+          
+          $webConfig | Out-File -FilePath "$publishDir\web.config" -Encoding UTF8
+          Write-Host "Web.config created successfully"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/publish'
+        artifactName: 'next-app'
+        publishLocation: 'Container'
+
+- stage: Deploy
+  displayName: 'Deploy to IIS'
+  dependsOn: 
+  - Validate
+  - Build
+  condition: and(succeeded(), eq(dependencies.Validate.outputs['CheckProject.ProjectCheck.hasProject'], 'true'))
+  variables:
+    useStaticExport: $[ stageDependencies.Build.BuildNextJs.outputs['ExportCheck.useStaticExport'] ]
+  jobs:
+  - deployment: DeployToIIS
+    displayName: 'Deploy to IIS Server'
+    environment: 'Production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: 'next-app'
+              downloadType: 'single'
+              downloadPath: '$(Pipeline.Workspace)'
+
+          - task: PowerShell@2
+            displayName: 'Deploy to IIS'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                
+                # Variables
+                $siteName = "$(siteName)"
+                $physicalPath = "$(physicalPath)"
+                $appPoolName = "$(appPoolName)"
+                $parentSite = "$(parentSiteName)"
+                $sourcePath = "$(Pipeline.Workspace)\next-app"
+                $useStaticExport = "$(useStaticExport)"
+                
+                Write-Host "===== DEPLOYMENT CONFIGURATION ====="
+                Write-Host "Site: $siteName"
+                Write-Host "Physical Path: $physicalPath"
+                Write-Host "App Pool: $appPoolName"
+                Write-Host "Parent Site: $parentSite"
+                Write-Host "Source: $sourcePath"
+                Write-Host "Static Export: $useStaticExport"
+                
+                # Clean up disk space before deployment
+                Write-Host "===== CLEANING UP DISK SPACE ====="
+                $beforeCleanup = (Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object @{Name="FreeSpaceGB";Expression={[math]::Round($_.FreeSpace/1GB,2)}}).FreeSpaceGB
+                Write-Host "Free space before cleanup: $beforeCleanup GB"
+                
+                # Clean temporary files
+                try {
+                    Get-ChildItem -Path $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
+                        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                    
+                    # Clean old build artifacts (keep only last 3)
+                    $agentWorkDir = Split-Path (Split-Path $sourcePath -Parent) -Parent
+                    if (Test-Path $agentWorkDir) {
+                        Get-ChildItem -Path $agentWorkDir -Directory | 
+                            Where-Object { $_.Name -match '^\d+' -and $_.Name -ne '1' } |
+                            Sort-Object Name -Descending | 
+                            Select-Object -Skip 2 | 
+                            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    
+                    $afterCleanup = (Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object @{Name="FreeSpaceGB";Expression={[math]::Round($_.FreeSpace/1GB,2)}}).FreeSpaceGB
+                    Write-Host "Free space after cleanup: $afterCleanup GB"
+                    Write-Host "Space recovered: $([math]::Round($afterCleanup - $beforeCleanup, 2)) GB"
+                } catch {
+                    Write-Host "Cleanup completed with some warnings: $_"
+                }
+                
+                # Verify source path exists and has content
+                Write-Host "===== VERIFYING SOURCE FILES ====="
+                if (-not (Test-Path $sourcePath)) {
+                    Write-Error "Source path does not exist: $sourcePath"
+                    Write-Host "Available directories in $(Split-Path $sourcePath):"
+                    Get-ChildItem -Path (Split-Path $sourcePath) -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  - $($_.Name)" }
+                    exit 1
+                }
+                
+                $sourceFiles = Get-ChildItem -Path $sourcePath -Recurse | Measure-Object
+                Write-Host "Source contains $($sourceFiles.Count) files/folders"
+                Write-Host "Source directory contents:"
+                Get-ChildItem -Path $sourcePath | ForEach-Object { Write-Host "  - $($_.Name)" }
+                
+                # Import WebAdministration module
+                Import-Module WebAdministration
+                
+                # Stop app pool if it exists
+                if (Get-WebAppPool -Name $appPoolName -ErrorAction SilentlyContinue) {
+                    Write-Host "Stopping app pool: $appPoolName"
+                    Stop-WebAppPool -Name $appPoolName
+                    
+                    # Wait for app pool to stop
+                    do {
+                        Start-Sleep -Seconds 2
+                        $state = (Get-WebAppPool -Name $appPoolName).State
+                        Write-Host "App pool state: $state"
+                    } while ($state -ne "Stopped")
+                }
+                
+                # Create/configure app pool
+                if (!(Get-WebAppPool -Name $appPoolName -ErrorAction SilentlyContinue)) {
+                    Write-Host "Creating app pool: $appPoolName"
+                    New-WebAppPool -Name $appPoolName
+                }
+                
+                # Configure app pool settings
+                if ($useStaticExport -eq "true") {
+                    # Static site - use .NET runtime
+                    Set-ItemProperty -Path "IIS:\AppPools\$appPoolName" -Name "managedRuntimeVersion" -Value "v4.0"
+                } else {
+                    # Node.js app - no managed runtime
+                    Set-ItemProperty -Path "IIS:\AppPools\$appPoolName" -Name "managedRuntimeVersion" -Value ""
+                    Set-ItemProperty -Path "IIS:\AppPools\$appPoolName" -Name "processModel.identityType" -Value "ApplicationPoolIdentity"
+                }
+                
+                # Set additional app pool settings
+                Set-ItemProperty -Path "IIS:\AppPools\$appPoolName" -Name "recycling.periodicRestart.time" -Value "00:00:00"
+                Set-ItemProperty -Path "IIS:\AppPools\$appPoolName" -Name "processModel.idleTimeout" -Value "00:00:00"
+                
+                # Prepare physical directory
+                if (Test-Path $physicalPath) {
+                    Write-Host "Cleaning existing directory: $physicalPath"
+                    Get-ChildItem -Path $physicalPath -Force | Remove-Item -Recurse -Force
+                } else {
+                    Write-Host "Creating directory: $physicalPath"
+                    New-Item -ItemType Directory -Path $physicalPath -Force
+                }
+                
+                # Create/update IIS application
+                $app = Get-WebApplication -Site $parentSite -Name $siteName -ErrorAction SilentlyContinue
+                if ($app) {
+                    Write-Host "Updating existing application"
+                    Set-WebConfigurationProperty -Filter "system.applicationHost/sites/site[@name='$parentSite']/application[@path='/$siteName']" -Name "applicationPool" -Value $appPoolName
+                } else {
+                    Write-Host "Creating new application"
+                    New-WebApplication -Site $parentSite -Name $siteName -PhysicalPath $physicalPath -ApplicationPool $appPoolName
+                }
+                
+                # Copy application files
+                Write-Host "Copying application files..."
+                Copy-Item -Path "$sourcePath\*" -Destination $physicalPath -Recurse -Force
+                
+                # Install production dependencies for Node.js apps
+                if ($useStaticExport -ne "true") {
+                    Write-Host "Installing production dependencies..."
+                    Set-Location $physicalPath
+                    
+                    if (Test-Path "package-lock.json") {
+                        npm ci --only=production --no-audit
+                    } elseif (Test-Path "yarn.lock") {
+                        yarn install --production --frozen-lockfile
+                    } else {
+                        npm install --only=production --no-audit
+                    }
+                }
+                
+                # Set directory permissions
+                Write-Host "Setting directory permissions..."
+                $acl = Get-Acl $physicalPath
+                
+                # App pool identity permissions
+                $appPoolSid = (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-82")).Translate([System.Security.Principal.NTAccount])
+                $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS AppPool\$appPoolName", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+                $acl.SetAccessRule($accessRule)
+                
+                # IIS_IUSRS permissions
+                $iisUsersRule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS", "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+                $acl.SetAccessRule($iisUsersRule)
+                
+                Set-Acl $physicalPath $acl
+                
+                # Start app pool
+                Write-Host "Starting app pool: $appPoolName"
+                Start-WebAppPool -Name $appPoolName
+                
+                Write-Host "✓ Deployment completed successfully"
+
+          - task: PowerShell@2
+            displayName: 'Warm Up Application'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $siteName = "$(siteName)"
+                $useStaticExport = "$(useStaticExport)"
+                
+                if ($useStaticExport -eq "true") {
+                    $testUrl = "https://optiweb.optimusbank.com:8025/$siteName"
+                } else {
+                    $testUrl = "https://optiweb.optimusbank.com:8025/$siteName"
+                    Write-Host "Waiting for Node.js application to start..."
+                    Start-Sleep -Seconds 15
+                }
+                
+                Write-Host "Warming up application: $testUrl"
+                
+                $maxRetries = 5
+                $retryCount = 0
+                $success = $false
+                
+                do {
+                    try {
+                        $response = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 30
+                        if ($response.StatusCode -eq 200) {
+                            Write-Host "✓ Application is responding (Status: $($response.StatusCode))"
+                            $success = $true
+                        } else {
+                            Write-Host "⚠ Application returned status: $($response.StatusCode)"
+                        }
+                    } catch {
+                        $retryCount++
+                        Write-Host "Attempt $retryCount failed: $($_.Exception.Message)"
+                        if ($retryCount -lt $maxRetries) {
+                            Write-Host "Retrying in 10 seconds..."
+                            Start-Sleep -Seconds 10
+                        }
+                    }
+                } while (-not $success -and $retryCount -lt $maxRetries)
+                
+                if (-not $success) {
+                    Write-Host "⚠ Could not verify application startup, but deployment completed"
+                }
+
+- stage: Notify
+  displayName: 'Send Notifications'
+  dependsOn: 
+  - Validate
+  - Deploy
+  condition: and(always(), eq(dependencies.Validate.outputs['CheckProject.ProjectCheck.hasProject'], 'true'))
+  jobs:
+  - job: SendNotification
+    displayName: 'Send Deployment Notification'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Send Email Notification'
+      condition: succeeded('Deploy')
+      inputs:
+        targetType: 'inline'
+        script: |
+          try {
+              $siteName = "$(siteName)"
+              $useStaticExport = "$(useStaticExport)"
+              $deploymentType = if ($useStaticExport -eq "true") { "Static Site" } else { "Server-Side Application" }
+              
+              $emailParams = @{
+                  SmtpServer = "smtp.netcorecloud.net"
+                  Port = 587
+                  UseSsl = $true
+                  Credential = New-Object System.Management.Automation.PSCredential(
+                      "$(smtpUsername)",
+                      (ConvertTo-SecureString "$(smtpPassword)" -AsPlainText -Force)
+                  )
+                  From = "notifications@optimusbank.com"
+                  To = @("aishat.ibrahim@optimusbank.com", "oluwatomilola.aturaka@optimusbank.com", "toluwani.lekan-afinni@optimusbank.com")
+                  Subject = "✓ Next.js Deployment Successful - $siteName"
+                  Body = @"
+          Hello Team,
+
+          The Next.js application '$siteName' has been successfully deployed.
+
+          📋 Deployment Details:
+          • Application: $siteName
+          • Type: $deploymentType
+          • URL: https://optiweb.optimusbank.com:8025/$siteName
+          • Build: $(Build.BuildNumber)
+          • Deployment Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          • Branch: $(Build.SourceBranchName)
+
+          The application is now live and ready for use.
+
+          Best regards,
+          DevOps Team
+          "@
+              }
+              
+              Send-MailMessage @emailParams
+              Write-Host "✓ Deployment notification sent successfully"
+          } catch {
+              Write-Host "⚠ Failed to send notification: $_"
+          }
+
+    - task: PowerShell@2
+      displayName: 'Log Final Status'
+      condition: always()
+      inputs:
+        targetType: 'inline'
+        script: |
+          $deployStatus = "$(Agent.JobStatus)"
+          $siteName = "$(siteName)"
+          
+          Write-Host "=========================================="
+          Write-Host "PIPELINE EXECUTION SUMMARY"
+          Write-Host "=========================================="
+          Write-Host "Application: $siteName"
+          Write-Host "Status: $deployStatus"
+          Write-Host "Build Number: $(Build.BuildNumber)"
+          Write-Host "Commit: $(Build.SourceVersion)"
+          Write-Host "Branch: $(Build.SourceBranchName)"
+          
+          if ($deployStatus -eq "Succeeded") {
+              Write-Host "✓ Application deployed successfully"
+              Write-Host "URL: https://optiweb.optimusbank.com:8025/$siteName"
+          } else {
+              Write-Host "✗ Deployment encountered issues"
+          }
+          Write-Host "=========================================="
