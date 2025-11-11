@@ -1,0 +1,17 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: OptimusBank-ServiceManagementOrg/Azure-Nextjs-CICD
+      ref: main
+      endpoint: optimus-github-service-connection
+
+jobs:
+  - template: nextjs-cicd-scripts/Nextjs-cicd-staging.yml@templates
