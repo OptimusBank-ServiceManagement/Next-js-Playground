@@ -4,26 +4,23 @@ trigger:
 pr: none
 
 pool:
-  name: Default  # self-hosted Windows agent
+  name: Default   # your self-hosted Windows agent pool name
 
-# The Next.js app lives in another repo but in the SAME PROJECT
+# Reference to your Next.js app repo (same Azure DevOps project)
 resources:
   repositories:
     - repository: nextApp
       type: git
-      name: '<YourAppRepoName>'   # <<< CHANGE THIS to the exact repo name (same project)
-      # ref: refs/heads/app-dev   # optional default branch
+      name: YourNextJsRepo   # <-- change this to your actual repo name
 
 variables:
   - group: smtp-variables
 
-  - name: repoName
-    value: $[replace(variables['Build.Repository.Name'], '.*/','')]
-
   - name: nodeVersion
     value: '18.x'
 
-  # IIS settings (you can hardcode siteName if you prefer app repo name)
+  - name: repoName
+    value: $[replace(variables['Build.Repository.Name'], '.*/','')]
   - name: siteName
     value: '$(repoName)'
   - name: physicalPath
@@ -33,10 +30,10 @@ variables:
   - name: parentSiteName
     value: 'Optimus Apps'
 
+# ===============================================
+# 1) VALIDATE — ensure this is a Next.js project
+# ===============================================
 stages:
-# ============================
-# 1) VALIDATE (Cmd only)
-# ============================
 - stage: Validate
   displayName: 'Validate Project'
   jobs:
@@ -44,53 +41,35 @@ stages:
     displayName: 'Check for Next.js Project'
     steps:
     - checkout: self
-      displayName: 'Checkout Infra Repo (CICD YAML)'
-
+      displayName: 'Checkout CICD Repo'
     - checkout: nextApp
+      path: s/nextApp
       displayName: 'Checkout Next.js App Repo'
 
     - task: CmdLine@2
-      displayName: 'Log context and list dirs'
-      inputs:
-        script: |
-          echo ===== PIPELINE CONTEXT =====
-          echo Build.Repository.Name: $(Build.Repository.Name)
-          echo Build.SourceBranch   : $(Build.SourceBranch)
-          echo Build.SourcesDirectory: $(Build.SourcesDirectory)
-          echo System.DefaultWorkingDirectory: $(System.DefaultWorkingDirectory)
-          echo Pipeline.Workspace   : $(Pipeline.Workspace)
-          echo.
-          echo ===== DIR: Build.SourcesDirectory =====
-          dir "$(Build.SourcesDirectory)"
-          echo.
-          echo ===== DIR: nextApp =====
-          if exist "$(Build.SourcesDirectory)\nextApp" (dir "$(Build.SourcesDirectory)\nextApp") else (echo nextApp not found)
-
-    - task: CmdLine@2
+      displayName: 'Check Next.js marker'
       name: ProjectCheck
-      displayName: 'Validate Next.js markers'
       inputs:
         script: |
           set APPROOT=$(Build.SourcesDirectory)\nextApp
+          echo Checking for Next.js marker...
           if not exist "%APPROOT%\package.json" (
             echo No package.json found in app repo
             echo ##vso[task.setvariable variable=hasProject;isOutput=true]false
             exit /b 0
           )
-
-          rem Basic check: look for "next" string in package.json
           findstr /i "\"next\"" "%APPROOT%\package.json" >nul 2>nul
           if errorlevel 1 (
             echo "next" dependency not found in package.json
             echo ##vso[task.setvariable variable=hasProject;isOutput=true]false
           ) else (
-            echo Next.js dependency marker found
+            echo Next.js dependency found
             echo ##vso[task.setvariable variable=hasProject;isOutput=true]true
           )
 
-# ============================
-# 2) BUILD (Cmd only)
-# ============================
+# ===============================================
+# 2) BUILD — install, lint, test, build, package
+# ===============================================
 - stage: Build
   displayName: 'Build Application'
   dependsOn: Validate
@@ -100,12 +79,13 @@ stages:
     displayName: 'Build Next.js Application'
     steps:
     - checkout: self
-      displayName: 'Checkout Infra Repo (CICD YAML)'
+      displayName: 'Checkout CICD Repo'
     - checkout: nextApp
+      path: s/nextApp
       displayName: 'Checkout Next.js App Repo'
 
     - task: NodeTool@0
-      displayName: 'Setup Node.js $(nodeVersion)'
+      displayName: 'Use Node $(nodeVersion)'
       inputs:
         versionSpec: '$(nodeVersion)'
 
@@ -113,9 +93,11 @@ stages:
       displayName: 'Log Node & npm versions'
       inputs:
         script: |
+          echo ===== Node & npm Versions =====
           node -v
           npm -v
-          echo PATH=%PATH%
+          echo ===== PATH =====
+          echo %PATH%
 
     - task: Cache@2
       displayName: 'Cache node_modules'
@@ -126,7 +108,7 @@ stages:
         path: $(Build.SourcesDirectory)/nextApp/node_modules
 
     - task: CmdLine@2
-      displayName: 'Install dependencies'
+      displayName: 'Install Dependencies'
       inputs:
         script: |
           cd /d "$(Build.SourcesDirectory)\nextApp"
@@ -134,10 +116,10 @@ stages:
             echo Using npm ci
             npm ci --prefer-offline
           ) else if exist yarn.lock (
-            echo Using yarn install --frozen-lockfile
+            echo Using yarn install
             yarn install --frozen-lockfile --prefer-offline
           ) else (
-            echo No lockfile; running npm install
+            echo No lockfile found
             npm install
           )
 
@@ -147,8 +129,13 @@ stages:
         script: |
           cd /d "$(Build.SourcesDirectory)\nextApp"
           if exist package.json (
-            rem Run lint if script exists; ignore failures
-            npm run lint -- --no-fix --quiet || echo Lint finished with issues (ignored)
+            npm run -s | findstr /b /i "  lint" >nul 2>nul
+            if not errorlevel 1 (
+              echo Running lint...
+              npm run lint -- --no-fix --quiet || echo Lint completed with warnings.
+            ) else (
+              echo No lint script; skipping
+            )
           )
 
     - task: CmdLine@2
@@ -156,18 +143,16 @@ stages:
       inputs:
         script: |
           cd /d "$(Build.SourcesDirectory)\nextApp"
-          if exist package.json (
-            npm run -s | findstr /b /i "  test" >nul 2>nul
-            if not errorlevel 1 (
-              echo Running tests...
-              npm run test -- --watchAll=false --ci=true --coverage --reporters=default --reporters=jest-junit || exit /b 1
-            ) else (
-              echo No test script; skipping
-            )
+          npm run -s | findstr /b /i "  test" >nul 2>nul
+          if not errorlevel 1 (
+            echo Running tests...
+            npm run test -- --watchAll=false --ci=true --coverage --reporters=default --reporters=jest-junit || exit /b 1
+          ) else (
+            echo No test script found; skipping
           )
 
     - task: PublishTestResults@2
-      displayName: 'Publish Test Results'
+      displayName: 'Publish test results'
       condition: succeededOrFailed()
       inputs:
         testResultsFormat: 'JUnit'
@@ -175,185 +160,77 @@ stages:
         failTaskOnFailedTests: true
 
     - task: PublishCodeCoverageResults@1
-      displayName: 'Publish Code Coverage'
+      displayName: 'Publish coverage'
       condition: succeededOrFailed()
       inputs:
         codeCoverageTool: 'Cobertura'
         summaryFileLocation: '$(Build.SourcesDirectory)/nextApp/coverage/cobertura-coverage.xml'
 
     - task: CmdLine@2
-      displayName: 'Build Application (next build)'
+      displayName: 'Build Application'
       inputs:
         script: |
           cd /d "$(Build.SourcesDirectory)\nextApp"
-          set NODE_OPTIONS=--max_old_space_size=4096
           set NODE_ENV=production
           set NEXT_TELEMETRY_DISABLED=1
-          echo NODE_ENV=%NODE_ENV%
-          echo NEXT_TELEMETRY_DISABLED=%NEXT_TELEMETRY_DISABLED%
-          echo NODE_OPTIONS=%NODE_OPTIONS%
-          echo ===== RUNNING: npm run build =====
+          set NODE_OPTIONS=--max_old_space_size=4096
+          echo Building Next.js app...
           npm run build || exit /b 1
-          if exist ".next" (
-            echo Build successful; listing .next
-            dir /b ".next"
-          ) else (
-            echo .next not found; failing
+          if not exist ".next" (
+            echo Build failed: .next not found
             exit /b 1
+          ) else (
+            echo Build succeeded.
           )
 
     - task: CmdLine@2
       name: ExportCheck
-      displayName: 'Handle static export (if script exists)'
+      displayName: 'Static export check'
       inputs:
         script: |
           cd /d "$(Build.SourcesDirectory)\nextApp"
           set USE_STATIC=false
           npm run -s | findstr /b /i "  export" >nul 2>nul
           if not errorlevel 1 (
-            echo Running npm run export...
-            npm run export || echo Export failed
-            if exist "out" (
-              set USE_STATIC=true
-              echo Static export found.
-            )
+            echo Running export...
+            npm run export
+            if exist "out" set USE_STATIC=true
           )
           echo ##vso[task.setvariable variable=useStaticExport;isOutput=true]%USE_STATIC%
 
     - task: CmdLine@2
-      displayName: 'Prepare deployment package'
+      displayName: 'Package for deployment'
       inputs:
         script: |
           set PUBLISH=$(Build.ArtifactStagingDirectory)\publish
           set APPROOT=$(Build.SourcesDirectory)\nextApp
           set USE_STATIC=$(ExportCheck.useStaticExport)
-          echo Publish dir: %PUBLISH%
-          echo USE_STATIC: %USE_STATIC%
           if not exist "%PUBLISH%" mkdir "%PUBLISH%"
           cd /d "%APPROOT%"
-
           if /i "%USE_STATIC%"=="true" (
-            if exist "out" (
-              robocopy "out" "%PUBLISH%" /E /NFL /NDL /NJH /NJS /NC /NS
-            ) else (
-              echo out directory not found; treating as server-side
-            )
+            echo Copying static export...
+            robocopy "out" "%PUBLISH%" /E /NFL /NDL /NJH /NJS /NC /NS
+          ) else (
+            echo Copying server files...
+            robocopy ".next" "%PUBLISH%\.next" /E
+            if exist public robocopy public "%PUBLISH%\public" /E
+            if exist package.json copy /Y package.json "%PUBLISH%"
+            if exist package-lock.json copy /Y package-lock.json "%PUBLISH%"
+            if exist yarn.lock copy /Y yarn.lock "%PUBLISH%"
+            for %%F in (next.config.js next.config.cjs next.config.mjs) do if exist %%F copy /Y %%F "%PUBLISH%"
           )
-
-          if /i not "%USE_STATIC%"=="true" (
-            if not exist ".next" (
-              echo .next missing; build likely failed
-              exit /b 1
-            )
-            robocopy ".next" "%PUBLISH%\.next" /E /NFL /NDL /NJH /NJS /NC /NS
-            if exist "public" robocopy "public" "%PUBLISH%\public" /E /NFL /NDL /NJH /NJS /NC /NS
-            if exist "package.json" copy /Y "package.json" "%PUBLISH%"
-            if exist "package-lock.json" copy /Y "package-lock.json" "%PUBLISH%"
-            if exist "yarn.lock" copy /Y "yarn.lock" "%PUBLISH%"
-            for %%F in (next.config.js next.config.cjs next.config.mjs) do (
-              if exist "%%F" copy /Y "%%F" "%PUBLISH%"
-            )
-          )
-
-          echo Package ready at %PUBLISH%
-          dir /b "%PUBLISH%"
-
-    - task: CmdLine@2
-      displayName: 'Create server.js (only for server-side)'
-      condition: eq(variables['ExportCheck.useStaticExport'], 'false')
-      inputs:
-        script: |
-          set PUBLISH=$(Build.ArtifactStagingDirectory)\publish
-          if not exist "%PUBLISH%" mkdir "%PUBLISH%"
-          > "%PUBLISH%\server.js" (
-            echo const { createServer } = require('http')
-            echo const { parse } = require('url')
-            echo const next = require('next')
-            echo.
-            echo const dev = process.env.NODE_ENV !== 'production'
-            echo const hostname = process.env.WEBSITE_HOSTNAME ^|^| 'localhost'
-            echo const port = process.env.PORT ^|^| 3000
-            echo.
-            echo const app = next({ dev, hostname, port })
-            echo const handle = app.getRequestHandler()
-            echo.
-            echo app.prepare().then(() => {
-            echo ^  createServer(async (req, res) => {
-            echo ^    try {
-            echo ^      const parsedUrl = parse(req.url, true)
-            echo ^      await handle(req, res, parsedUrl)
-            echo ^    } catch (err) {
-            echo ^      console.error('Error occurred handling', req.url, err)
-            echo ^      res.statusCode = 500
-            echo ^      res.end('internal server error')
-            echo ^    }
-            echo ^  }).listen(port, (err) => {
-            echo ^    if (err) throw err
-            echo ^    console.log(`> Ready on http://^${hostname}:^${port}`)
-            echo ^  })
-            echo })
-          )
-          echo Created %PUBLISH%\server.js
-
-    - task: CmdLine@2
-      displayName: 'Create web.config (only for server-side)'
-      condition: eq(variables['ExportCheck.useStaticExport'], 'false')
-      inputs:
-        script: |
-          set PUBLISH=$(Build.ArtifactStagingDirectory)\publish
-          > "%PUBLISH%\web.config" (
-            echo ^<?xml version="1.0" encoding="utf-8"?^>
-            echo ^<configuration^>
-            echo   ^<system.webServer^>
-            echo     ^<handlers^>
-            echo       ^<add name="iisnode" path="server.js" verb="*" modules="iisnode"/^>
-            echo     ^</handlers^>
-            echo     ^<rewrite^>
-            echo       ^<rules^>
-            echo         ^<rule name="NodeInspector" patternSyntax="ECMAScript" stopProcessing="true"^>
-            echo           ^<match url="^server.js\/debug[\/]?" /^>
-            echo         ^</rule^>
-            echo         ^<rule name="StaticContent"^>
-            echo           ^<action type="Rewrite" url="public{REQUEST_URI}"/^>
-            echo         ^</rule^>
-            echo         ^<rule name="DynamicContent"^>
-            echo           ^<conditions^>
-            echo             ^<add input="{REQUEST_FILENAME}" matchType="IsFile" negate="True"/^>
-            echo           ^</conditions^>
-            echo           ^<action type="Rewrite" url="server.js"/^>
-            echo         ^</rule^>
-            echo       ^</rules^>
-            echo     ^</rewrite^>
-            echo     ^<security^>
-            echo       ^<requestFiltering^>
-            echo         ^<hiddenSegments^>
-            echo           ^<remove segment="bin"/^>
-            echo         ^</hiddenSegments^>
-            echo       ^</requestFiltering^>
-            echo     ^</security^>
-            echo     ^<httpErrors existingResponse="PassThrough" /^>
-            echo     ^<httpCompression^>
-            echo       ^<dynamicTypes^>
-            echo         ^<add mimeType="application/json" enabled="true"/^>
-            echo         ^<add mimeType="application/javascript" enabled="true"/^>
-            echo       ^</dynamicTypes^>
-            echo     ^</httpCompression^>
-            echo     ^<iisnode watchedFiles="web.config;*.js" loggingEnabled="true" debuggingEnabled="false"/^>
-            echo   ^</system.webServer^>
-            echo ^</configuration^>
-          )
-          echo Created %PUBLISH%\web.config
+          dir "%PUBLISH%"
 
     - task: PublishBuildArtifacts@1
-      displayName: 'Publish Build Artifacts'
+      displayName: 'Publish build artifacts'
       inputs:
         pathToPublish: '$(Build.ArtifactStagingDirectory)/publish'
         artifactName: 'next-app'
         publishLocation: 'Container'
 
-# ============================
-# 3) DEPLOY (Cmd only, IIS)
-# ============================
+# ===============================================
+# 3) DEPLOY — copy to IIS, setup app pool, warmup
+# ===============================================
 - stage: Deploy
   displayName: 'Deploy to IIS'
   dependsOn:
@@ -379,7 +256,7 @@ stages:
               downloadPath: '$(Pipeline.Workspace)'
 
           - task: CmdLine@2
-            displayName: 'IIS deploy via appcmd/robocopy/icacls'
+            displayName: 'Deploy to IIS'
             inputs:
               script: |
                 set SITENAME=$(siteName)
@@ -388,137 +265,69 @@ stages:
                 set PARENTSITE=$(parentSiteName)
                 set SOURCE=$(Pipeline.Workspace)\next-app
                 set USE_STATIC=$(useStaticExport)
-
-                echo ===== DEPLOYMENT CONFIG =====
-                echo Site: %SITENAME%
-                echo PhysicalPath: %PHYSPATH%
-                echo AppPool: %APPPOOL%
-                echo ParentSite: %PARENTSITE%
-                echo Source: %SOURCE%
-                echo StaticExport: %USE_STATIC%
-
-                if not exist "%SOURCE%" (
-                  echo Source path missing: %SOURCE%
-                  dir "$(Pipeline.Workspace)"
-                  exit /b 1
-                )
-
+                echo Deploying %SITENAME%
                 set APPCMD=%windir%\system32\inetsrv\appcmd.exe
-
-                rem Stop app pool if exists
+                if not exist "%SOURCE%" exit /b 1
                 "%APPCMD%" list apppool /name:"%APPPOOL%" >nul 2>nul
-                if not errorlevel 1 (
-                  echo Stopping app pool %APPPOOL%...
-                  "%APPCMD%" stop apppool /apppool.name:"%APPPOOL%"
-                )
-
-                rem Create app pool if not exists
+                if not errorlevel 1 "%APPCMD%" stop apppool /apppool.name:"%APPPOOL%"
                 "%APPCMD%" list apppool /name:"%APPPOOL%" >nul 2>nul
-                if errorlevel 1 (
-                  echo Creating app pool %APPPOOL%...
-                  "%APPCMD%" add apppool /name:"%APPPOOL%"
-                )
-
+                if errorlevel 1 "%APPCMD%" add apppool /name:"%APPPOOL%"
                 if /i "%USE_STATIC%"=="true" (
-                  echo Configuring app pool runtime for static site
                   "%APPCMD%" set apppool "%APPPOOL%" /managedRuntimeVersion:v4.0
                 ) else (
-                  echo Configuring app pool runtime for Node (no managed runtime)
                   "%APPCMD%" set apppool "%APPPOOL%" /managedRuntimeVersion:
                 )
-
-                rem Ensure physical path exists and is clean
                 if exist "%PHYSPATH%" rd /s /q "%PHYSPATH%"
                 mkdir "%PHYSPATH%"
-
-                rem Create or update IIS application under parent site
                 "%APPCMD%" list app "%PARENTSITE%/%SITENAME%" >nul 2>nul
                 if errorlevel 1 (
-                  echo Creating IIS application /%SITENAME% under site "%PARENTSITE%"
                   "%APPCMD%" add app /site.name:"%PARENTSITE%" /path:/"%SITENAME%" /physicalPath:"%PHYSPATH%" /applicationPool:"%APPPOOL%"
                 ) else (
-                  echo Updating app pool and physical path
-                  "%APPCMD%" set app "%PARENTSITE%/%SITENAME%" /applicationPool:"%APPPOOL%"
                   "%APPCMD%" set vdir "%PARENTSITE%/%SITENAME%/" /physicalPath:"%PHYSPATH%"
                 )
-
-                echo Copying files to %PHYSPATH%...
                 robocopy "%SOURCE%" "%PHYSPATH%" /MIR /NFL /NDL /NJH /NJS /NC /NS
-                if errorlevel 8 (
-                  echo robocopy reported a fatal error
-                  exit /b 1
-                )
-
                 if /i not "%USE_STATIC%"=="true" (
-                  echo Installing production deps on server folder...
                   cd /d "%PHYSPATH%"
-                  if exist package-lock.json (
-                    npm ci --only=production --no-audit
-                  ) else if exist yarn.lock (
-                    yarn install --production --frozen-lockfile
-                  ) else (
-                    npm install --only=production --no-audit
-                  )
+                  if exist package-lock.json npm ci --only=production --no-audit
+                  if exist yarn.lock yarn install --production --frozen-lockfile
                 )
-
-                echo Setting ACLs...
                 icacls "%PHYSPATH%" /grant "IIS AppPool\%APPPOOL%":(OI)(CI)F /T
                 icacls "%PHYSPATH%" /grant IIS_IUSRS:(OI)(CI)RX /T
-
-                echo Starting app pool %APPPOOL%...
                 "%APPCMD%" start apppool /apppool.name:"%APPPOOL%"
 
-                echo ✓ Deployment completed
-
           - task: CmdLine@2
-            displayName: 'Warm up (curl with retries)'
+            displayName: 'Warm up application'
             inputs:
               script: |
                 set URL=https://optiweb.optimusbank.com:8025/$(siteName)
-                set RETRIES=5
-                set COUNT=0
-                if /i not "$(useStaticExport)"=="true" (
-                  echo Waiting 15s for Node process to come up...
-                  ping -n 16 127.0.0.1 >nul
-                )
-                :loop
-                echo Warming up %URL% (attempt %COUNT% of %RETRIES%)...
-                curl --insecure --max-time 30 -s -o NUL -w "HTTP %%{http_code}\n" "%URL%"
-                if errorlevel 1 (
-                  set /a COUNT+=1
-                  if %COUNT% LSS %RETRIES% (
-                    echo Retry in 10s...
-                    ping -n 11 127.0.0.1 >nul
-                    goto loop
-                  ) else (
-                    echo ⚠ Warm-up did not reach HTTP 200, continuing anyway.
-                  )
-                )
+                echo Warming up %URL%
+                ping -n 15 127.0.0.1 >nul
+                curl --insecure --max-time 30 -s -o NUL "%URL%"
+                echo Warm-up completed.
 
-# ============================
-# 4) SUMMARY (Cmd)
-# ============================
+# ===============================================
+# 4) NOTIFY — summary log (email optional)
+# ===============================================
 - stage: Notify
-  displayName: 'Summary'
+  displayName: 'Final Summary'
   dependsOn:
   - Validate
   - Deploy
-  condition: and(always(), eq(dependencies.Validate.outputs['CheckProject.ProjectCheck.hasProject'], 'true'))
+  condition: always()
   jobs:
   - job: FinalSummary
-    displayName: 'Final Log Summary'
+    displayName: 'Pipeline Summary'
     steps:
     - task: CmdLine@2
-      displayName: 'Log final status'
+      displayName: 'Print summary'
       inputs:
         script: |
           echo ==========================================
           echo PIPELINE EXECUTION SUMMARY
           echo ==========================================
-          echo Application  : $(siteName)
-          echo Status       : $(Agent.JobStatus)
-          echo Build Number : $(Build.BuildNumber)
-          echo Commit       : $(Build.SourceVersion)
-          echo Branch       : $(Build.SourceBranchName)
-          echo URL          : https://optiweb.optimusbank.com:8025/$(siteName)
+          echo Application : $(siteName)
+          echo Status      : $(Agent.JobStatus)
+          echo Build       : $(Build.BuildNumber)
+          echo Branch      : $(Build.SourceBranchName)
+          echo URL         : https://optiweb.optimusbank.com:8025/$(siteName)
           echo ==========================================
